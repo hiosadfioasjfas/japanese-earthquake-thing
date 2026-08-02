@@ -27,19 +27,13 @@ workers would each poll JMA independently and serve inconsistent data.
 import os
 import time
 import threading
-import math
 import traceback
 import functools
 
 import requests
 from flask import Flask, jsonify
 
-# Force every print() call to flush immediately. Without this, Python
-# block-buffers stdout when it isn't attached to a real terminal (which is
-# exactly gunicorn's case), so log lines can appear drastically delayed,
-# reordered, or batched together - which is almost certainly why multiple
-# "entering iteration N" lines showed up bunched into the same second
-# during debugging, instead of ~20s apart as POLL_INTERVAL_S should cause.
+# Force every print() call to flush immediately.
 print = functools.partial(print, flush=True)
 
 PORT = int(os.environ.get("PORT", 8787))
@@ -47,16 +41,16 @@ POLL_INTERVAL_S = 20  # be polite to JMA - no need to poll faster than this
 LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 DETAIL_BASE = "https://www.jma.go.jp/bosai/quake/data/"
 
-# Official JMA seismic-intensity station master: every station's Code here
-# is the SAME code used in the live feed's IntensityStation.Code field, so
-# matching live readings to real lat/lon is a direct dict lookup - no
-# fuzzy name matching needed. ~4,360 stations nationwide (JMA's own network
-# plus local-government points JMA folds into the same feed).
+# How many of the most recent events in list.json to actually fetch detail
+# JSON for, per poll cycle. list.json contains the full recent history
+# (can be dozens of entries), not just the newest one - without this cap,
+# poll_once() re-fetches detail JSON for the same old events forever, on
+# every single cycle, and never keeps up with POLL_INTERVAL_S=20s.
+MAX_EVENTS_PER_POLL = 5
+
 STATION_MASTER_URL = "https://www.jma.go.jp/jma/kishou/know/jishin/intens-st/stations.json"
-# Fallback mirror (community-maintained, same schema/codes) in case JMA's
-# own host is unreachable from wherever this relay is deployed.
 STATION_MASTER_FALLBACK_URL = "https://raw.githubusercontent.com/iku55/jma_int_stations/main/stations.json"
-STATION_MASTER_REFRESH_S = 24 * 60 * 60  # station list barely ever changes - refetch once/day
+STATION_MASTER_REFRESH_S = 24 * 60 * 60
 
 INTENSITY_MAP = {
     "0": 0, "1": 1, "2": 2, "3": 3, "4": 4,
@@ -68,30 +62,18 @@ INTENSITY_MAP = {
 app = Flask(__name__)
 
 _lock = threading.Lock()
-_station_state = {}   # code -> dict (live readings, intensity etc.)
+_station_state = {}
 _last_poll_ok = None
 _last_poll_error = None
-_last_poll_attempt = None  # NEW: set at the START of every poll attempt, so
-                            # /health can tell "never tried" apart from
-                            # "tried and is currently running/stuck"
+_last_poll_attempt = None
 _poller_started = False
 _poller_lock = threading.Lock()
 
 _master_lock = threading.Lock()
-_station_master = {}       # code -> { code, name, name_ja, pref, lat, lon, affi }
+_station_master = {}
 _master_last_fetch_ok = None
 _master_last_error = None
-_current_event_json = None
 
-# A real browser-like User-Agent. JMA's public data endpoints are known to
-# 403 non-browser-looking User-Agents on some hosts (Render's IP ranges
-# included) even though curl/browsers from a residential IP work fine.
-# This was the actual bug: request calls were getting HTTP 403 responses
-# back, .raise_for_status() correctly raised, but the exception was being
-# swallowed inside poll_once()'s per-item try/except without ever being
-# logged anywhere visible, so it just looked like "silently does nothing"
-# from outside. See fetch_json() below for the fix (real logging + a
-# guaranteed _last_poll_error update on every failure path).
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -100,33 +82,15 @@ HEADERS = {
     "Accept": "application/json,text/plain,*/*",
 }
 
-# Single shared session (connection pooling + consistent headers/timeouts).
 _session = requests.Session()
 _session.headers.update(HEADERS)
 
-REQUEST_TIMEOUT = (5, 10)  # (connect timeout, read timeout) - explicit tuple so a
-                           # slow/hanging TCP handshake can't block past 5s even if
-                           # the read side would otherwise wait the full 10s
-
-
-# NOTE: an earlier version of this file routed fetch_json() through a
-# ThreadPoolExecutor with a hard .result(timeout=...) ceiling, intended to
-# guarantee no request could hang the poll loop indefinitely. In practice,
-# that indirection was the actual bug: calls submitted from inside the
-# background poll thread never completed, while the identical request made
-# directly (e.g. from a Flask request handler in /debug-detail) worked
-# fine every time. Removed in favor of calling requests.get() directly,
-# which is proven working. REQUEST_TIMEOUT below still bounds each call at
-# the socket level.
+REQUEST_TIMEOUT = (5, 10)
 
 
 def fetch_json(url, what):
     """GET a URL and parse JSON, with real error visibility. Never raises -
-    returns (data, error_string). Calls requests.get() directly (no thread
-    pool indirection) - this matches /debug-detail exactly, which is
-    confirmed working against live JMA data, whereas the previous
-    ThreadPoolExecutor-based version never completed a single successful
-    call from inside the background poll thread."""
+    returns (data, error_string)."""
     print(f"[relay] fetch_json: starting {what} ({url})")
     try:
         resp = _session.get(url, timeout=REQUEST_TIMEOUT)
@@ -189,8 +153,6 @@ def extract_station_readings(detail_json):
 
 
 def _parse_master_payload(raw):
-    """Normalize the JMA station master (or the fallback mirror, which
-    shares the same schema) into { code -> station dict }."""
     parsed = {}
     if not isinstance(raw, list):
         return parsed
@@ -210,16 +172,12 @@ def _parse_master_payload(raw):
             "pref": pref.get("name") if isinstance(pref, dict) else pref,
             "lat": lat,
             "lon": lon,
-            "affi": entry.get("affi"),  # e.g. "気象庁" (JMA) vs local government
+            "affi": entry.get("affi"),
         }
     return parsed
 
 
 def fetch_station_master(force=False):
-    """Fetch and cache the real JMA station master. Tries JMA's own file
-    first (authoritative), falls back to the community mirror if JMA's
-    host is unreachable from this deployment. Safe to call repeatedly -
-    only refetches if stale or forced."""
     global _master_last_fetch_ok, _master_last_error
 
     with _master_lock:
@@ -246,7 +204,6 @@ def fetch_station_master(force=False):
         print(f"[relay] station master loaded: {len(parsed)} stations (source: {url})")
         return
 
-    # both sources failed
     with _master_lock:
         _master_last_error = last_err
     print(f"[relay] station master fetch failed: {last_err}")
@@ -278,8 +235,11 @@ def poll_once():
 
     merged = {}
 
-    # Walk every earthquake in list.json (newest first)
-    for item in quake_list:
+    # FIX: only look at the most recent N events, not the whole history
+    # JMA's list.json returns. Without this cap, every poll cycle re-walks
+    # the entire event backlog, taking far longer than POLL_INTERVAL_S and
+    # effectively starving the loop.
+    for item in quake_list[:MAX_EVENTS_PER_POLL]:
         json_file = item.get("json")
         if not json_file:
             continue
@@ -299,7 +259,6 @@ def poll_once():
             if not code:
                 continue
 
-            # Already have a newer reading for this station.
             if code in merged:
                 continue
 
@@ -328,9 +287,6 @@ def poll_once():
     if not merged:
         print("[relay] poll_once: no readings this cycle")
 
-print(
-    f"[relay] pid={os.getpid()} updated: {len(_station_state)} stations"
-)
 
 def poll_loop():
     print("[relay] live poll thread started")
@@ -340,7 +296,6 @@ def poll_loop():
             print("[relay] polling JMA...")
 
             fetch_station_master()
-
             poll_once()
 
             with _lock:
@@ -357,17 +312,11 @@ def poll_loop():
 
 
 def ensure_poller_started():
-    """Starts the background poll + decay threads exactly once, even if
-    Flask/gunicorn imports this module more than once (e.g. the reloader
-    in debug mode, or gunicorn's worker boot process)."""
     global _poller_started
     with _poller_lock:
         if _poller_started:
             return
         _poller_started = True
-        # Fetch the real station master synchronously before serving, so the
-        # very first poll/response already has correct lat/lon - not just
-        # after the first 24h refresh cycle.
         try:
             fetch_station_master(force=True)
         except Exception as e:
@@ -379,21 +328,18 @@ def ensure_poller_started():
 
 @app.route("/stations")
 def stations():
-    return jsonify({
-        "pid": os.getpid(),
-        "stationCount": len(_station_state),
-        "updatedAt": _last_poll_ok,
-        "error": _last_poll_error,
-        "stations": list(_station_state.values()),
-    })
+    with _lock:
+        return jsonify({
+            "pid": os.getpid(),
+            "stationCount": len(_station_state),
+            "updatedAt": _last_poll_ok,
+            "error": _last_poll_error,
+            "stations": list(_station_state.values()),
+        })
 
 
 @app.route("/all-stations")
 def all_stations():
-    """Every real JMA station (~4,360 nationwide), regardless of whether
-    it has reported a live reading recently. Roblox should call this ONCE
-    on boot to spawn a Part for every real station, then poll /stations
-    on a timer for live intensity updates to color/pulse them."""
     with _master_lock:
         return jsonify({
             "updatedAt": _master_last_fetch_ok,
@@ -420,45 +366,40 @@ def health():
 
 @app.route("/debug-detail")
 def debug_detail():
-    """Returns the combined station readings from the most recent
-    earthquakes, similar to JQuake's live map."""
+    """Returns combined station readings from the most recent earthquakes."""
+    quake_list, err = fetch_json(LIST_URL, "debug quake list")
+    if err or not isinstance(quake_list, list):
+        return jsonify({"error": err or "quake list was invalid"})
 
-    try:
-        resp = requests.get(LIST_URL, headers=HEADERS, timeout=15)
-        quake_list = resp.json()
-    except Exception as e:
-        return jsonify({"error": f"list fetch failed: {e}"})
-
-    if not isinstance(quake_list, list):
-        return jsonify({"error": "quake list was invalid"})
+    # FIX: `recent` was never defined in the original code (NameError on
+    # every request). It should be a slice of the freshly-fetched list.
+    recent = quake_list[:MAX_EVENTS_PER_POLL]
 
     merged = {}
     detail_urls = []
 
     for item in recent:
-        detail_url = DETAIL_BASE + item["json"]
+        json_file = item.get("json")
+        if not json_file:
+            continue
+        detail_url = DETAIL_BASE + json_file
         detail_urls.append(detail_url)
 
-        try:
-            r = requests.get(detail_url, headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
-
-            detail_json = r.json()
-            readings = extract_station_readings(detail_json)
-
-            for reading in readings:
-                code = reading["code"]
-
-                # Keep the strongest intensity seen for this station.
-                if (
-                    code not in merged or
-                    reading["intensity"] > merged[code]["intensity"]
-                ):
-                    merged[code] = reading
-
-        except Exception:
+        detail_json, derr = fetch_json(detail_url, f"debug detail ({json_file})")
+        if derr or not detail_json:
             continue
+
+        readings = extract_station_readings(detail_json)
+
+        for reading in readings:
+            code = reading["code"]
+            if not code:
+                continue
+            if (
+                code not in merged or
+                reading["intensity"] > merged[code]["intensity"]
+            ):
+                merged[code] = reading
 
     return jsonify({
         "events_checked": len(recent),
@@ -467,25 +408,22 @@ def debug_detail():
         "detail_urls": detail_urls,
     })
 
+
 @app.route("/debug-fetch")
 def debug_fetch():
-    """Runs the exact same quake-list fetch as poll_once(), but
-    synchronously inside this request - no background thread, no log
-    buffering, no timing ambiguity. Hit this directly in a browser and
-    whatever it returns (including if the request itself hangs/times out
-    in the browser) tells us definitively what's happening."""
-    import time as _time
-    started = _time.time()
+    """Runs the exact same quake-list fetch as poll_once(), synchronously,
+    inside this request - for isolating network issues."""
+    started = time.time()
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=15)
-        elapsed = _time.time() - started
+        elapsed = time.time() - started
         return jsonify({
             "elapsed_seconds": elapsed,
             "status_code": resp.status_code,
             "body_preview": resp.text[:1000],
         })
     except Exception as e:
-        elapsed = _time.time() - started
+        elapsed = time.time() - started
         return jsonify({
             "elapsed_seconds": elapsed,
             "exception_type": str(type(e)),
@@ -497,7 +435,7 @@ def debug_fetch():
 def index():
     return jsonify({
         "service": "jquake-roblox-relay",
-        "endpoints": ["/all-stations", "/stations", "/health"],
+        "endpoints": ["/all-stations", "/stations", "/health", "/debug-detail", "/debug-fetch"],
     })
 
 
