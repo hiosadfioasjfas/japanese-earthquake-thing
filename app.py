@@ -258,6 +258,7 @@ def poll_once():
     with _lock:
         _last_poll_attempt = time.time()
 
+    print("[relay] poll_once started")
     quake_list, err = fetch_json(LIST_URL, "quake list")
     if err:
         with _lock:
@@ -269,7 +270,12 @@ def poll_once():
             _last_poll_error = "quake list was not a JSON list"
         return
 
-    latest = next((q for q in quake_list if q.get("json")), None)
+    latest = None
+
+    for q in quake_list:
+        if q.get("json") and q.get("status") != "cancel":
+            latest = q
+            break
 
     if latest is None:
         with _lock:
@@ -291,6 +297,10 @@ def poll_once():
 
     readings = extract_station_readings(detail)
 
+    print(
+        f"[relay] event { _current_event_json } "
+        f"produced {len(readings)} station readings"
+    )
     now = time.time()
 
     with _master_lock:
@@ -331,23 +341,26 @@ def poll_once():
         print("[relay] poll_once: no readings this cycle")
 
 def poll_loop():
-    global _last_poll_error
-    print("[relay] poll_loop: thread body has started executing")  # DIAGNOSTIC
-    iteration = 0
+    print("[relay] live poll thread started")
+
     while True:
-        iteration += 1
-        print(f"[relay] poll_loop: entering iteration {iteration}")  # DIAGNOSTIC
         try:
-            fetch_station_master()  # no-op if already fresh; retries if it failed before
+            print("[relay] polling JMA...")
+
+            fetch_station_master()
+
             poll_once()
-        except Exception as e:
-            # Broad catch is intentional (this loop must never die), but
-            # now it prints a full traceback instead of just str(e), so a
-            # bug inside poll_once() is actually diagnosable from logs.
+
             with _lock:
-                _last_poll_error = f"{e}"
-            print(f"[relay] poll failed: {e}")
+                print(
+                    f"[relay] state now has {len(_station_state)} stations, "
+                    f"last ok={_last_poll_ok}"
+                )
+
+        except Exception as e:
+            print(f"[relay] poll error: {e}")
             traceback.print_exc()
+
         time.sleep(POLL_INTERVAL_S)
 
 
