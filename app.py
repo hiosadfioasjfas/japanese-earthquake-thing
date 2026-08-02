@@ -253,12 +253,7 @@ def fetch_station_master(force=False):
 
 
 def poll_once():
-    global (
-        _last_poll_ok,
-        _last_poll_error,
-        _last_poll_attempt,
-        _current_event_json,
-    )
+    global _last_poll_ok, _last_poll_error, _last_poll_attempt, _current_event_json
 
     with _lock:
         _last_poll_attempt = time.time()
@@ -332,7 +327,7 @@ def poll_once():
         f"[relay] updated {_current_event_json}: {len(new_state)} live stations"
     )
 
-    if not found_any:
+    if not new_state:
         print("[relay] poll_once: no readings this cycle")
 
 def poll_loop():
