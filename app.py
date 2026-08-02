@@ -30,9 +30,18 @@ import threading
 import math
 import traceback
 import concurrent.futures
+import functools
 
 import requests
 from flask import Flask, jsonify
+
+# Force every print() call to flush immediately. Without this, Python
+# block-buffers stdout when it isn't attached to a real terminal (which is
+# exactly gunicorn's case), so log lines can appear drastically delayed,
+# reordered, or batched together - which is almost certainly why multiple
+# "entering iteration N" lines showed up bunched into the same second
+# during debugging, instead of ~20s apart as POLL_INTERVAL_S should cause.
+print = functools.partial(print, flush=True)
 
 PORT = int(os.environ.get("PORT", 8787))
 POLL_INTERVAL_S = 20  # be polite to JMA - no need to poll faster than this
@@ -424,6 +433,32 @@ def health():
             "masterStationCount": len(_station_master),
             "masterLastFetchOk": _master_last_fetch_ok,
             "masterLastError": _master_last_error,
+        })
+
+
+@app.route("/debug-fetch")
+def debug_fetch():
+    """Runs the exact same quake-list fetch as poll_once(), but
+    synchronously inside this request - no background thread, no log
+    buffering, no timing ambiguity. Hit this directly in a browser and
+    whatever it returns (including if the request itself hangs/times out
+    in the browser) tells us definitively what's happening."""
+    import time as _time
+    started = _time.time()
+    try:
+        resp = requests.get(LIST_URL, headers=HEADERS, timeout=15)
+        elapsed = _time.time() - started
+        return jsonify({
+            "elapsed_seconds": elapsed,
+            "status_code": resp.status_code,
+            "body_preview": resp.text[:1000],
+        })
+    except Exception as e:
+        elapsed = _time.time() - started
+        return jsonify({
+            "elapsed_seconds": elapsed,
+            "exception_type": str(type(e)),
+            "exception": str(e),
         })
 
 
