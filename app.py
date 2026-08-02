@@ -462,7 +462,7 @@ def debug_detail():
             detail_json = r.json()
             readings = extract_station_readings(detail_json)
             result["readings_found"] = len(readings)
-            result["sample_readings"] = readings[:5]
+            result["readings"] = readings
             result["has_Body_key"] = "Body" in detail_json
             result["top_level_keys"] = list(detail_json.keys())
             if not readings:
