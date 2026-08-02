@@ -263,7 +263,7 @@ def poll_once():
     with _lock:
         _last_poll_attempt = time.time()
 
-   quake_list, err = fetch_json(LIST_URL, "quake list")
+quake_list, err = fetch_json(LIST_URL, "quake list")
 if err:
     with _lock:
         _last_poll_error = err
