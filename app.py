@@ -436,6 +436,51 @@ def health():
         })
 
 
+@app.route("/debug-detail")
+def debug_detail():
+    """Fetches the list, takes the first (most recent) event, and tries
+    several plausible detail-URL shapes for JMA's current API (since
+    'json' key based URLs don't exist in the current list.json schema -
+    it uses 'eid' instead). Reports what each attempt returns so we can
+    see the real detail schema and find station-level data if it exists."""
+    import time as _time
+    try:
+        resp = requests.get(LIST_URL, headers=HEADERS, timeout=15)
+        quake_list = resp.json()
+    except Exception as e:
+        return jsonify({"error": f"list fetch failed: {e}"})
+
+    if not quake_list:
+        return jsonify({"error": "list was empty"})
+
+    first = quake_list[0]
+    eid = first.get("eid")
+    ser = first.get("ser", "1")
+
+    candidate_urls = [
+        f"https://www.jma.go.jp/bosai/quake/data/{eid}_{ser}.json",
+        f"https://www.jma.go.jp/bosai/quake/data/{eid}.json",
+        f"https://www.jma.go.jp/bosai/quake/data/list/{eid}.json",
+    ]
+
+    attempts = []
+    for url in candidate_urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            attempts.append({
+                "url": url,
+                "status": r.status_code,
+                "body_preview": r.text[:800] if r.status_code == 200 else r.text[:200],
+            })
+        except Exception as e:
+            attempts.append({"url": url, "error": str(e)})
+
+    return jsonify({
+        "first_list_item": first,
+        "detail_attempts": attempts,
+    })
+
+
 @app.route("/debug-fetch")
 def debug_fetch():
     """Runs the exact same quake-list fetch as poll_once(), but
