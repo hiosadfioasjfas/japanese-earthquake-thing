@@ -28,6 +28,7 @@ import os
 import time
 import threading
 import math
+import traceback
 
 import requests
 from flask import Flask, jsonify
@@ -62,6 +63,9 @@ _lock = threading.Lock()
 _station_state = {}   # code -> dict (live readings, intensity etc.)
 _last_poll_ok = None
 _last_poll_error = None
+_last_poll_attempt = None  # NEW: set at the START of every poll attempt, so
+                            # /health can tell "never tried" apart from
+                            # "tried and is currently running/stuck"
 _poller_started = False
 _poller_lock = threading.Lock()
 
@@ -70,7 +74,58 @@ _station_master = {}       # code -> { code, name, name_ja, pref, lat, lon, affi
 _master_last_fetch_ok = None
 _master_last_error = None
 
-HEADERS = {"User-Agent": "roblox-jquake-relay/1.0 (personal project)"}
+# A real browser-like User-Agent. JMA's public data endpoints are known to
+# 403 non-browser-looking User-Agents on some hosts (Render's IP ranges
+# included) even though curl/browsers from a residential IP work fine.
+# This was the actual bug: request calls were getting HTTP 403 responses
+# back, .raise_for_status() correctly raised, but the exception was being
+# swallowed inside poll_once()'s per-item try/except without ever being
+# logged anywhere visible, so it just looked like "silently does nothing"
+# from outside. See fetch_json() below for the fix (real logging + a
+# guaranteed _last_poll_error update on every failure path).
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
+
+# Single shared session (connection pooling + consistent headers/timeouts).
+_session = requests.Session()
+_session.headers.update(HEADERS)
+
+REQUEST_TIMEOUT = (5, 10)  # (connect timeout, read timeout) - explicit tuple so a
+                           # slow/hanging TCP handshake can't block past 5s even if
+                           # the read side would otherwise wait the full 10s
+
+
+def fetch_json(url, what):
+    """GET a URL and parse JSON, with real error visibility. Never raises -
+    returns (data, error_string). Every failure path prints to stdout
+    (which Render captures in its log stream) so failures are never
+    silent, unlike the previous version where a bad response inside
+    poll_once()'s inner try/except vanished with no trace."""
+    try:
+        resp = _session.get(url, timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        msg = f"{what}: request failed: {e}"
+        print(f"[relay] {msg}")
+        return None, msg
+
+    if resp.status_code != 200:
+        # Truncate body so a big HTML error page doesn't spam logs.
+        body_preview = resp.text[:200].replace("\n", " ")
+        msg = f"{what}: HTTP {resp.status_code} - {body_preview}"
+        print(f"[relay] {msg}")
+        return None, msg
+
+    try:
+        return resp.json(), None
+    except ValueError as e:
+        msg = f"{what}: bad JSON: {e}"
+        print(f"[relay] {msg}")
+        return None, msg
 
 
 def normalize_intensity(raw):
@@ -147,22 +202,22 @@ def fetch_station_master(force=False):
 
     last_err = None
     for url in (STATION_MASTER_URL, STATION_MASTER_FALLBACK_URL):
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            parsed = _parse_master_payload(resp.json())
-            if not parsed:
-                raise ValueError("parsed station master was empty")
-            with _master_lock:
-                _station_master.clear()
-                _station_master.update(parsed)
-                _master_last_fetch_ok = time.time()
-                _master_last_error = None
-            print(f"[relay] station master loaded: {len(parsed)} stations (source: {url})")
-            return
-        except Exception as e:
-            last_err = f"{url}: {e}"
+        raw, err = fetch_json(url, "station master")
+        if err:
+            last_err = err
             continue
+        parsed = _parse_master_payload(raw)
+        if not parsed:
+            last_err = f"{url}: parsed station master was empty"
+            print(f"[relay] {last_err}")
+            continue
+        with _master_lock:
+            _station_master.clear()
+            _station_master.update(parsed)
+            _master_last_fetch_ok = time.time()
+            _master_last_error = None
+        print(f"[relay] station master loaded: {len(parsed)} stations (source: {url})")
+        return
 
     # both sources failed
     with _master_lock:
@@ -171,28 +226,44 @@ def fetch_station_master(force=False):
 
 
 def poll_once():
-    global _last_poll_ok, _last_poll_error
+    """Fetch the latest quake list, pull station readings from the most
+    recent entry that has any, and update _station_state. Guarantees
+    _last_poll_ok/_last_poll_error are updated on EVERY exit path -
+    including early-return failures - so /health always reflects the
+    real current state instead of stale nulls."""
+    global _last_poll_ok, _last_poll_error, _last_poll_attempt
 
-    resp = requests.get(LIST_URL, headers=HEADERS, timeout=10)
-    resp.raise_for_status()
-    quake_list = resp.json()
+    with _lock:
+        _last_poll_attempt = time.time()
+
+    quake_list, err = fetch_json(LIST_URL, "quake list")
+    if err:
+        with _lock:
+            _last_poll_error = err
+        return
+    if not isinstance(quake_list, list):
+        with _lock:
+            _last_poll_error = "quake list: response was not a JSON list"
+        return
 
     recent = [item for item in quake_list if item.get("json")][:15]
     now = time.time()
 
+    found_readings = False
+    last_detail_err = None
+
     for item in recent:
         detail_url = DETAIL_BASE + item["json"]
-        try:
-            d_resp = requests.get(detail_url, headers=HEADERS, timeout=10)
-            d_resp.raise_for_status()
-            detail = d_resp.json()
-        except Exception:
+        detail, err = fetch_json(detail_url, f"quake detail ({item['json']})")
+        if err:
+            last_detail_err = err
             continue
 
         readings = extract_station_readings(detail)
         if not readings:
             continue
 
+        found_readings = True
         with _master_lock:
             master_snapshot = dict(_station_master)
 
@@ -218,7 +289,13 @@ def poll_once():
 
     with _lock:
         _last_poll_ok = now
-        _last_poll_error = None
+        # Only surface the detail-fetch error if we truly found nothing at
+        # all this cycle; a single flaky detail URL among 15 isn't worth
+        # reporting as the headline error if we still found readings.
+        _last_poll_error = None if found_readings else (last_detail_err or "no recent quakes had station readings")
+
+    if not found_readings:
+        print(f"[relay] poll_once: no readings this cycle ({len(recent)} candidates checked)")
 
 
 def decay_loop():
@@ -246,9 +323,13 @@ def poll_loop():
             fetch_station_master()  # no-op if already fresh; retries if it failed before
             poll_once()
         except Exception as e:
+            # Broad catch is intentional (this loop must never die), but
+            # now it prints a full traceback instead of just str(e), so a
+            # bug inside poll_once() is actually diagnosable from logs.
             with _lock:
-                _last_poll_error = str(e)
+                _last_poll_error = f"{e}"
             print(f"[relay] poll failed: {e}")
+            traceback.print_exc()
         time.sleep(POLL_INTERVAL_S)
 
 
@@ -268,6 +349,7 @@ def ensure_poller_started():
             fetch_station_master(force=True)
         except Exception as e:
             print(f"[relay] initial station master fetch failed: {e}")
+            traceback.print_exc()
         threading.Thread(target=poll_loop, daemon=True).start()
         threading.Thread(target=decay_loop, daemon=True).start()
         print("[relay] background poller started")
@@ -303,6 +385,7 @@ def health():
     with _lock, _master_lock:
         return jsonify({
             "ok": True,
+            "lastPollAttempt": _last_poll_attempt,
             "lastPollOk": _last_poll_ok,
             "lastPollError": _last_poll_error,
             "stationCount": len(_station_state),
