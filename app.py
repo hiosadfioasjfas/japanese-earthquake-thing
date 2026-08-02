@@ -497,6 +497,8 @@ def stations():
         for code, master in _station_master.items():
             live = _station_state.get(code)
 
+            "intensity": live["intensity"] if live else 0
+
             stations.append({
                 "code": code,
                 "name": master.get("name_ja") or code,
