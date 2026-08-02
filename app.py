@@ -241,18 +241,25 @@ def extract_station_readings(detail_json):
 
 def _parse_master_payload(raw):
     parsed = {}
+
     if not isinstance(raw, list):
         return parsed
+
     for entry in raw:
         code = entry.get("code")
         if not code:
             continue
+
+        code = str(code)
+
         try:
             lat = float(entry.get("lat"))
             lon = float(entry.get("lon"))
         except (TypeError, ValueError):
             continue
+
         pref = entry.get("pref") or {}
+
         parsed[code] = {
             "code": code,
             "name_ja": entry.get("name"),
@@ -261,8 +268,8 @@ def _parse_master_payload(raw):
             "lon": lon,
             "affi": entry.get("affi"),
         }
-    return parsed
 
+    return parsed
 
 def fetch_station_master(force=False):
     global _master_last_fetch_ok, _master_last_error
@@ -387,7 +394,7 @@ def poll_once():
             events_with_readings += 1
 
             for r in readings:
-                code = r.get("code")
+                code = str(r.get("code"))
                 if not code:
                     continue
 
@@ -417,6 +424,8 @@ def poll_once():
 
     with _lock:
         _station_state.clear()
+        print("[relay] sample live codes:", list(merged.keys())[:5])
+        print("[relay] sample master codes:", list(master_snapshot.keys())[:5])
         _station_state.update(merged)
         _last_poll_ok = now
         _last_poll_error = (
