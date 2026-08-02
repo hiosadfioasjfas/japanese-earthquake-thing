@@ -22,6 +22,28 @@ That only works correctly with exactly ONE worker process (see the
 `gunicorn --workers 1` in render.yaml). Do not raise the worker count
 without moving state into something shared (e.g. Redis) - multiple
 workers would each poll JMA independently and serve inconsistent data.
+
+--------------------------------------------------------------------
+FIX (see poll_once): list.json interleaves many JMA bulletin types -
+hypocenter-only reports, tsunami-only bulletins, foreign/offshore
+events with no felt shaking in Japan - alongside actual felt-intensity
+reports. Only entries with a Body.Intensity.Observation block produce
+any station readings. The old code sliced only the newest
+MAX_EVENTS_PER_POLL (5) entries and fetched detail JSON for exactly
+those, regardless of whether they were the right *kind* of entry. If
+the 5 most recent list.json items all happened to be non-intensity
+bulletins (very plausible in a quiet stretch), extract_station_readings
+returned [] for all 5, merged stayed {}, and /stations legitimately -
+but wrongly - reported 0 live stations.
+
+The fix separates "how far back to look" (SCAN_WINDOW) from "how many
+detail JSONs we're willing to fetch" (MAX_EVENTS_PER_POLL, now a fetch
+budget rather than a blind slice). poll_once() now walks forward
+through up to SCAN_WINDOW list entries, fetching detail JSON for up to
+MAX_EVENTS_PER_POLL of them, until it finds intensity data or runs out
+of budget/window. In the common case (newest event has data) this costs
+exactly the same single fetch as before.
+--------------------------------------------------------------------
 """
 
 import os
@@ -42,11 +64,19 @@ POLL_INTERVAL_S = 20  # be polite to JMA - no need to poll faster than this
 LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 DETAIL_BASE = "https://www.jma.go.jp/bosai/quake/data/"
 
-# How many of the most recent events in list.json to actually fetch detail
-# JSON for, per poll cycle. list.json contains the full recent history
-# (can be dozens of entries), not just the newest one - without this cap,
-# poll_once() re-fetches detail JSON for the same old events forever, on
-# every single cycle, and never keeps up with POLL_INTERVAL_S=20s.
+# How far back into list.json (most-recent-first) we're willing to scan
+# per poll cycle, looking for entries that actually carry felt-intensity
+# data. This is just a "how far do we look" cap - it does NOT mean we
+# fetch detail JSON for all of them (see MAX_EVENTS_PER_POLL below).
+SCAN_WINDOW = 20
+
+# How many detail JSON fetches we're willing to spend per poll cycle.
+# This used to be a blind slice of the newest N list.json entries
+# (list.json[:MAX_EVENTS_PER_POLL]) - that's what caused the bug
+# described above. It's now a fetch budget: poll_once() walks through
+# up to SCAN_WINDOW entries and stops fetching once it has spent this
+# many detail-JSON requests, so a quiet/duplicate-heavy stretch of the
+# feed can't blow past POLL_INTERVAL_S or hammer JMA.
 MAX_EVENTS_PER_POLL = 5
 
 STATION_MASTER_URL = "https://www.jma.go.jp/jma/kishou/know/jishin/intens-st/stations.json"
@@ -243,6 +273,29 @@ def fetch_station_master(force=False):
 
 
 def poll_once():
+    """
+    Fetch the recent-events list, then walk forward through it looking
+    for events that actually carry felt-intensity station data.
+
+    FIXED BEHAVIOR: previously this did
+        for item in quake_list[:MAX_EVENTS_PER_POLL]:
+    which blindly fetched detail JSON for only the newest 5 list.json
+    entries, no matter what kind of bulletin they were. list.json mixes
+    intensity-bearing reports in with hypocenter-only / tsunami-only /
+    no-shaking bulletins, so it was entirely possible (and apparently
+    what you're hitting) for the newest 5 entries to ALL be the wrong
+    kind, in which case merged stayed empty and /stations correctly-but-
+    misleadingly reported 0 live stations even during otherwise-normal
+    operation.
+
+    Now: SCAN_WINDOW bounds how far back into the list we're willing to
+    look, MAX_EVENTS_PER_POLL bounds how many detail-JSON fetches we're
+    willing to spend doing it (to stay polite to JMA and keep each cycle
+    comfortably under POLL_INTERVAL_S). Events with no Body.Intensity
+    block still consume a bit of scan distance but do NOT count as a
+    "wasted" fetch differently from before - they just don't stop the
+    walk early anymore.
+    """
     global _last_poll_ok, _last_poll_error, _last_poll_attempt
 
     with _lock:
@@ -267,12 +320,16 @@ def poll_once():
         master_snapshot = dict(_station_master)
 
     merged = {}
+    events_fetched = 0
+    events_scanned = 0
+    events_with_readings = 0
 
-    # FIX: only look at the most recent N events, not the whole history
-    # JMA's list.json returns. Without this cap, every poll cycle re-walks
-    # the entire event backlog, taking far longer than POLL_INTERVAL_S and
-    # effectively starving the loop.
-    for item in quake_list[:MAX_EVENTS_PER_POLL]:
+    for item in quake_list[:SCAN_WINDOW]:
+        if events_fetched >= MAX_EVENTS_PER_POLL:
+            break
+
+        events_scanned += 1
+
         json_file = item.get("json")
         if not json_file:
             continue
@@ -281,11 +338,19 @@ def poll_once():
             DETAIL_BASE + json_file,
             f"quake detail ({json_file})",
         )
+        events_fetched += 1
 
         if err or not detail:
             continue
 
         readings = extract_station_readings(detail)
+        if not readings:
+            # No Body.Intensity.Observation block - hypocenter-only,
+            # tsunami-only, or similar bulletin type. Just move on to
+            # the next list entry instead of giving up for the cycle.
+            continue
+
+        events_with_readings += 1
 
         for r in readings:
             code = r.get("code")
@@ -315,7 +380,11 @@ def poll_once():
         _last_poll_ok = now
         _last_poll_error = None
 
-    print(f"[relay] updated: {len(merged)} live stations")
+    print(
+        f"[relay] updated: {len(merged)} live stations "
+        f"(scanned {events_scanned} list entries, fetched {events_fetched} details, "
+        f"{events_with_readings} had intensity data)"
+    )
 
     if not merged:
         print("[relay] poll_once: no readings this cycle")
@@ -412,9 +481,9 @@ def debug_detail():
     if err or not isinstance(quake_list, list):
         return jsonify({"error": err or "quake list was invalid"})
 
-    # FIX: `recent` was never defined in the original code (NameError on
-    # every request). It should be a slice of the freshly-fetched list.
-    recent = quake_list[:MAX_EVENTS_PER_POLL]
+    # Uses the same SCAN_WINDOW as poll_once() for consistency when
+    # comparing this debug view against what the live poller sees.
+    recent = quake_list[:SCAN_WINDOW]
 
     merged = {}
     detail_urls = []
