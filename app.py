@@ -195,10 +195,34 @@ def normalize_intensity(raw):
 
 
 def extract_station_readings(detail_json):
-    """Walk Body.Intensity.Observation.Pref[].Area[].City[].IntensityStation[]"""
+    """Walk Body.Intensity.Observation.Pref[].Area[].City[].IntensityStation[]
+
+    BUG THIS GUARDS AGAINST: JMA's detail JSON does not omit the
+    "Intensity" key for events with no felt intensity - it sets it to
+    JSON null explicitly. That means:
+        (detail_json.get("Body") or {}).get("Intensity", {})
+    returns None, not {}, because .get(key, default) only falls back to
+    the default when the KEY is missing, not when its value is null.
+    Calling .get("Observation") on that None then raised an uncaught
+    AttributeError inside poll_once() on almost every single poll cycle
+    (most events have no felt intensity), which silently crashed the
+    poll before it ever reached the code that records _last_poll_ok /
+    _last_poll_error - hence /health showing both stuck at null forever
+    even though lastPollAttempt kept updating.
+    """
     out = []
-    obs = (detail_json.get("Body") or {}).get("Intensity", {}).get("Observation")
-    if not obs or not isinstance(obs.get("Pref"), list):
+    body = detail_json.get("Body")
+    if not isinstance(body, dict):
+        return out
+
+    intensity_block = body.get("Intensity")
+    if not isinstance(intensity_block, dict):
+        # Key missing OR explicitly null - both mean "no felt intensity
+        # data for this event," which is normal and common, not an error.
+        return out
+
+    obs = intensity_block.get("Observation")
+    if not isinstance(obs, dict) or not isinstance(obs.get("Pref"), list):
         return out
 
     for pref in obs["Pref"]:
@@ -323,6 +347,7 @@ def poll_once():
     events_fetched = 0
     events_scanned = 0
     events_with_readings = 0
+    per_event_errors = []
 
     for item in quake_list[:SCAN_WINDOW]:
         if events_fetched >= MAX_EVENTS_PER_POLL:
@@ -330,60 +355,79 @@ def poll_once():
 
         events_scanned += 1
 
-        json_file = item.get("json")
-        if not json_file:
-            continue
-
-        detail, err = fetch_json(
-            DETAIL_BASE + json_file,
-            f"quake detail ({json_file})",
-        )
-        events_fetched += 1
-
-        if err or not detail:
-            continue
-
-        readings = extract_station_readings(detail)
-        if not readings:
-            # No Body.Intensity.Observation block - hypocenter-only,
-            # tsunami-only, or similar bulletin type. Just move on to
-            # the next list entry instead of giving up for the cycle.
-            continue
-
-        events_with_readings += 1
-
-        for r in readings:
-            code = r.get("code")
-            if not code:
+        # Guard each individual event so one malformed/unexpected detail
+        # payload can't take down the whole poll cycle (which is exactly
+        # what happened before: one bad event -> uncaught exception ->
+        # _last_poll_ok/_last_poll_error never get set, every cycle,
+        # forever). Any per-event problem is now recorded and skipped
+        # instead of propagating.
+        try:
+            json_file = item.get("json")
+            if not json_file:
                 continue
 
-            if code in merged:
+            detail, err = fetch_json(
+                DETAIL_BASE + json_file,
+                f"quake detail ({json_file})",
+            )
+            events_fetched += 1
+
+            if err or not detail:
+                if err:
+                    per_event_errors.append(err)
                 continue
 
-            master = master_snapshot.get(code, {})
+            readings = extract_station_readings(detail)
+            if not readings:
+                # No Body.Intensity.Observation block - hypocenter-only,
+                # tsunami-only, or similar bulletin type. Normal - move
+                # on to the next list entry instead of giving up.
+                continue
 
-            merged[code] = {
-                "code": code,
-                "name": r.get("name") or code,
-                "pref": r.get("pref") or master.get("pref"),
-                "lat": master.get("lat"),
-                "lon": master.get("lon"),
-                "matched": code in master_snapshot,
-                "intensity": r["intensity"],
-                "eventTime": item.get("at"),
-                "updatedAt": now,
-            }
+            events_with_readings += 1
+
+            for r in readings:
+                code = r.get("code")
+                if not code:
+                    continue
+
+                if code in merged:
+                    continue
+
+                master = master_snapshot.get(code, {})
+
+                merged[code] = {
+                    "code": code,
+                    "name": r.get("name") or code,
+                    "pref": r.get("pref") or master.get("pref"),
+                    "lat": master.get("lat"),
+                    "lon": master.get("lon"),
+                    "matched": code in master_snapshot,
+                    "intensity": r["intensity"],
+                    "eventTime": item.get("at"),
+                    "updatedAt": now,
+                }
+        except Exception as e:
+            # Never let a single event's parsing take down the cycle.
+            # Record it so it's visible in logs, then keep scanning.
+            msg = f"event {item.get('json', '?')}: {type(e).__name__}: {e}"
+            print(f"[relay] poll_once: error processing {msg}")
+            per_event_errors.append(msg)
+            continue
 
     with _lock:
         _station_state.clear()
         _station_state.update(merged)
         _last_poll_ok = now
-        _last_poll_error = None
+        _last_poll_error = (
+            f"{len(per_event_errors)} event(s) had errors this cycle; last: {per_event_errors[-1]}"
+            if per_event_errors else None
+        )
 
     print(
         f"[relay] updated: {len(merged)} live stations "
         f"(scanned {events_scanned} list entries, fetched {events_fetched} details, "
-        f"{events_with_readings} had intensity data)"
+        f"{events_with_readings} had intensity data, {len(per_event_errors)} errors)"
     )
 
     if not merged:
@@ -408,8 +452,17 @@ def poll_loop():
                 )
 
         except Exception as e:
-            print(f"[relay] poll error: {e}")
+            # Belt-and-suspenders: poll_once() now catches per-event
+            # errors internally, but if something outside that (e.g.
+            # fetch_station_master, or a bug in poll_once itself before
+            # it reaches its own try/except) still throws, make sure
+            # it's visible via /health instead of only appearing in
+            # logs - this is what let the original bug hide for so long.
+            msg = f"{type(e).__name__}: {e}"
+            print(f"[relay] poll error: {msg}")
             traceback.print_exc()
+            with _lock:
+                _last_poll_error = msg
 
         # Every fetch_json() call is now watchdog-bounded (FETCH_WATCHDOG_S),
         # so a full cycle should never take dramatically longer than
