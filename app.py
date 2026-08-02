@@ -29,6 +29,7 @@ import time
 import threading
 import math
 import traceback
+import concurrent.futures
 
 import requests
 from flask import Flask, jsonify
@@ -100,18 +101,45 @@ REQUEST_TIMEOUT = (5, 10)  # (connect timeout, read timeout) - explicit tuple so
                            # the read side would otherwise wait the full 10s
 
 
+# Dedicated small pool just for bounding network calls with a REAL wall-clock
+# timeout. requests' own `timeout=` only bounds socket-level connect/read
+# stalls - it does NOT reliably bound every possible hang (e.g. certain DNS
+# resolution paths, some TLS handshake edge cases, or contention under
+# gunicorn's gthread worker). Running the call in a worker thread and
+# calling .result(timeout=...) on it gives a hard ceiling no matter what
+# the underlying cause of a hang turns out to be.
+_fetch_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="fetch")
+HARD_WALLCLOCK_TIMEOUT = 20  # seconds - absolute ceiling per fetch_json() call
+
+
+def _do_get(url):
+    return _session.get(url, timeout=REQUEST_TIMEOUT)
+
+
 def fetch_json(url, what):
-    """GET a URL and parse JSON, with real error visibility. Never raises -
-    returns (data, error_string). Every failure path prints to stdout
-    (which Render captures in its log stream) so failures are never
-    silent, unlike the previous version where a bad response inside
-    poll_once()'s inner try/except vanished with no trace."""
+    """GET a URL and parse JSON, with real error visibility and a hard
+    wall-clock ceiling. Never raises - returns (data, error_string). Every
+    entry/exit and failure path prints to stdout (captured in Render's log
+    stream) so failures - or hangs - are never silent."""
+    print(f"[relay] fetch_json: starting {what} ({url})")
+    future = _fetch_pool.submit(_do_get, url)
     try:
-        resp = _session.get(url, timeout=REQUEST_TIMEOUT)
+        resp = future.result(timeout=HARD_WALLCLOCK_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        msg = f"{what}: hard timeout after {HARD_WALLCLOCK_TIMEOUT}s (request never returned)"
+        print(f"[relay] {msg}")
+        future.cancel()
+        return None, msg
     except requests.exceptions.RequestException as e:
         msg = f"{what}: request failed: {e}"
         print(f"[relay] {msg}")
         return None, msg
+    except Exception as e:
+        msg = f"{what}: unexpected error: {e}"
+        print(f"[relay] {msg}")
+        return None, msg
+
+    print(f"[relay] fetch_json: {what} returned HTTP {resp.status_code}")
 
     if resp.status_code != 200:
         # Truncate body so a big HTML error page doesn't spam logs.
