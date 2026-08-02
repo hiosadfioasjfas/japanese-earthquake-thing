@@ -428,53 +428,55 @@ def health():
 
 @app.route("/debug-detail")
 def debug_detail():
-    """Fetches the list, takes the first (most recent) event, and fetches
-    its real detail URL using the 'json' field (DETAIL_BASE + item['json']),
-    exactly like poll_once() does. Reports the raw response plus whether
-    extract_station_readings() finds anything in it."""
+    """Returns the combined station readings from the most recent
+    earthquakes, similar to JQuake's live map."""
+
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=15)
         quake_list = resp.json()
     except Exception as e:
         return jsonify({"error": f"list fetch failed: {e}"})
 
-    if not quake_list:
-        return jsonify({"error": "list was empty"})
+    if not isinstance(quake_list, list):
+        return jsonify({"error": "quake list was invalid"})
 
-    first = quake_list[0]
-    json_field = first.get("json")
-    if not json_field:
-        return jsonify({"error": "first item has no 'json' field", "first_list_item": first})
+    # Look through the newest 20 events.
+    recent = [q for q in quake_list if q.get("json")][:20]
 
-    detail_url = DETAIL_BASE + json_field
-    try:
-        r = requests.get(detail_url, headers=HEADERS, timeout=10)
-    except Exception as e:
-        return jsonify({"error": f"detail fetch failed: {e}", "detail_url": detail_url})
+    merged = {}
+    detail_urls = []
 
-    result = {
-        "detail_url": detail_url,
-        "status": r.status_code,
-    }
+    for item in recent:
+        detail_url = DETAIL_BASE + item["json"]
+        detail_urls.append(detail_url)
 
-    if r.status_code == 200:
         try:
+            r = requests.get(detail_url, headers=HEADERS, timeout=10)
+            if r.status_code != 200:
+                continue
+
             detail_json = r.json()
             readings = extract_station_readings(detail_json)
-            result["readings_found"] = len(readings)
-            result["readings"] = readings
-            result["has_Body_key"] = "Body" in detail_json
-            result["top_level_keys"] = list(detail_json.keys())
-            if not readings:
-                result["body_preview"] = r.text[:1500]
-        except Exception as e:
-            result["json_parse_error"] = str(e)
-            result["body_preview"] = r.text[:800]
-    else:
-        result["body_preview"] = r.text[:500]
 
-    return jsonify(result)
+            for reading in readings:
+                code = reading["code"]
 
+                # Keep the strongest intensity seen for this station.
+                if (
+                    code not in merged or
+                    reading["intensity"] > merged[code]["intensity"]
+                ):
+                    merged[code] = reading
+
+        except Exception:
+            continue
+
+    return jsonify({
+        "events_checked": len(recent),
+        "readings_found": len(merged),
+        "readings": list(merged.values()),
+        "detail_urls": detail_urls,
+    })
 
 @app.route("/debug-fetch")
 def debug_fetch():
