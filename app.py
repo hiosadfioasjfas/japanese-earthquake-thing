@@ -318,7 +318,11 @@ def decay_loop():
 
 def poll_loop():
     global _last_poll_error
+    print("[relay] poll_loop: thread body has started executing")  # DIAGNOSTIC
+    iteration = 0
     while True:
+        iteration += 1
+        print(f"[relay] poll_loop: entering iteration {iteration}")  # DIAGNOSTIC
         try:
             fetch_station_master()  # no-op if already fresh; retries if it failed before
             poll_once()
