@@ -263,63 +263,71 @@ def poll_once():
     with _lock:
         _last_poll_attempt = time.time()
 
-    quake_list, err = fetch_json(LIST_URL, "quake list")
+   quake_list, err = fetch_json(LIST_URL, "quake list")
+if err:
+    with _lock:
+        _last_poll_error = err
+    return
+
+if not isinstance(quake_list, list):
+    with _lock:
+        _last_poll_error = "quake list: response was not a JSON list"
+    return
+
+now = time.time()
+
+with _master_lock:
+    master_snapshot = dict(_station_master)
+
+found_any = False
+
+for item in quake_list:
+    json_name = item.get("json")
+    if not json_name:
+        continue
+
+    detail, err = fetch_json(
+        DETAIL_BASE + json_name,
+        f"quake detail ({json_name})"
+    )
     if err:
-        with _lock:
-            _last_poll_error = err
-        return
-    if not isinstance(quake_list, list):
-        with _lock:
-            _last_poll_error = "quake list: response was not a JSON list"
-        return
+        continue
 
-    recent = [item for item in quake_list if item.get("json")][:15]
-    now = time.time()
+    readings = extract_station_readings(detail)
+    if not readings:
+        continue
 
-    found_readings = False
-    last_detail_err = None
-
-    for item in recent:
-        detail_url = DETAIL_BASE + item["json"]
-        detail, err = fetch_json(detail_url, f"quake detail ({item['json']})")
-        if err:
-            last_detail_err = err
-            continue
-
-        readings = extract_station_readings(detail)
-        if not readings:
-            continue
-
-        found_readings = True
-        with _master_lock:
-            master_snapshot = dict(_station_master)
-
-        with _lock:
-            for r in readings:
-                code = r.get("code")
-                if not code:
-                    continue
-                existing = _station_state.get(code, {})
-                master = master_snapshot.get(code)
-                _station_state[code] = {
-                    "code": code,
-                    "name": r.get("name") or existing.get("name") or code,
-                    "pref": r.get("pref") or existing.get("pref") or (master or {}).get("pref"),
-                    "lat": (master or {}).get("lat", existing.get("lat")),
-                    "lon": (master or {}).get("lon", existing.get("lon")),
-                    "matched": master is not None,  # True if this code was found in the real JMA master
-                    "intensity": r["intensity"],
-                    "eventTime": item.get("at"),
-                    "updatedAt": now,
-                }
-        break  # only need the most recent event that had readings
+    found_any = True
 
     with _lock:
-        _last_poll_ok = now
-        # Only surface the detail-fetch error if we truly found nothing at
-        # all this cycle; a single flaky detail URL among 15 isn't worth
-        # reporting as the headline error if we still found readings.
-        _last_poll_error = None if found_readings else (last_detail_err or "no recent quakes had station readings")
+        for r in readings:
+            code = r.get("code")
+            if not code:
+                continue
+
+            existing = _station_state.get(code, {})
+            master = master_snapshot.get(code)
+
+            # Keep the strongest reading if this station appears
+            # in multiple earthquakes.
+            if r["intensity"] <= existing.get("intensity", 0):
+                continue
+
+            _station_state[code] = {
+                "code": code,
+                "name": r.get("name") or existing.get("name") or code,
+                "pref": r.get("pref") or existing.get("pref") or (master or {}).get("pref"),
+                "lat": (master or {}).get("lat", existing.get("lat")),
+                "lon": (master or {}).get("lon", existing.get("lon")),
+                "matched": master is not None,
+                "intensity": r["intensity"],
+                "eventTime": item.get("at"),
+                "updatedAt": now,
+            }
+
+with _lock:
+    _last_poll_ok = now
+    _last_poll_error = None if found_any else "no station readings found"
 
     if not found_readings:
         print(f"[relay] poll_once: no readings this cycle ({len(recent)} candidates checked)")
