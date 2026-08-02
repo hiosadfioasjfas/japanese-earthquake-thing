@@ -305,9 +305,6 @@ def poll_once():
                 existing = _station_state.get(code, {})
                 master = master_snapshot.get(code)
 
-                if r["intensity"] <= existing.get("intensity", 0):
-                    continue
-
                 _station_state[code] = {
                     "code": code,
                     "name": r.get("name") or existing.get("name") or code,
