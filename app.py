@@ -253,12 +253,13 @@ def fetch_station_master(force=False):
 
 
 def poll_once():
-    global _last_poll_ok, _last_poll_error, _last_poll_attempt, _current_event_json
+    global _last_poll_ok, _last_poll_error, _last_poll_attempt
 
     with _lock:
         _last_poll_attempt = time.time()
 
     print("[relay] poll_once started")
+
     quake_list, err = fetch_json(LIST_URL, "quake list")
     if err:
         with _lock:
@@ -270,57 +271,61 @@ def poll_once():
             _last_poll_error = "quake list was not a JSON list"
         return
 
-    recent = [q for q in quake_list if q.get("json")][:20]
-
-merged = {}
-
-for item in recent:
-    detail, err = fetch_json(
-        DETAIL_BASE + item["json"],
-        f"quake detail ({item['json']})",
-    )
-
-    if err or not detail:
-        continue
-
-    readings = extract_station_readings(detail)
-
     now = time.time()
 
-    for r in readings:
-        code = r.get("code")
-        if not code:
+    with _master_lock:
+        master_snapshot = dict(_station_master)
+
+    merged = {}
+
+    # Walk every earthquake in list.json (newest first)
+    for item in quake_list:
+        json_file = item.get("json")
+        if not json_file:
             continue
 
-        master = master_snapshot.get(code)
+        detail, err = fetch_json(
+            DETAIL_BASE + json_file,
+            f"quake detail ({json_file})",
+        )
 
-        if (
-            code not in merged or
-            r["intensity"] > merged[code]["intensity"]
-        ):
+        if err or not detail:
+            continue
+
+        readings = extract_station_readings(detail)
+
+        for r in readings:
+            code = r.get("code")
+            if not code:
+                continue
+
+            # Already have a newer reading for this station.
+            if code in merged:
+                continue
+
+            master = master_snapshot.get(code, {})
+
             merged[code] = {
                 "code": code,
                 "name": r.get("name") or code,
-                "pref": r.get("pref") or (master or {}).get("pref"),
-                "lat": (master or {}).get("lat"),
-                "lon": (master or {}).get("lon"),
-                "matched": master is not None,
+                "pref": r.get("pref") or master.get("pref"),
+                "lat": master.get("lat"),
+                "lon": master.get("lon"),
+                "matched": code in master_snapshot,
                 "intensity": r["intensity"],
                 "eventTime": item.get("at"),
                 "updatedAt": now,
             }
 
-with _lock:
-    _station_state.clear()
-    _station_state.update(merged)
-    _last_poll_ok = now
-    _last_poll_error = None
-  
-    print(
-        f"[relay] updated {_current_event_json}: {len(new_state)} live stations"
-    )
+    with _lock:
+        _station_state.clear()
+        _station_state.update(merged)
+        _last_poll_ok = now
+        _last_poll_error = None
 
-    if not new_state:
+    print(f"[relay] updated: {len(merged)} live stations")
+
+    if not merged:
         print("[relay] poll_once: no readings this cycle")
 
 def poll_loop():
@@ -421,9 +426,6 @@ def debug_detail():
 
     if not isinstance(quake_list, list):
         return jsonify({"error": "quake list was invalid"})
-
-    # Look through the newest 20 events.
-    recent = [q for q in quake_list if q.get("json")][:20]
 
     merged = {}
     detail_urls = []
