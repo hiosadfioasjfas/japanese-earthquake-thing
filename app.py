@@ -46,7 +46,6 @@ PORT = int(os.environ.get("PORT", 8787))
 POLL_INTERVAL_S = 20  # be polite to JMA - no need to poll faster than this
 LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 DETAIL_BASE = "https://www.jma.go.jp/bosai/quake/data/"
-DECAY_HALF_LIFE_S = 5 * 60  # readings fade back toward 0 over ~5 minutes
 
 # Official JMA seismic-intensity station master: every station's Code here
 # is the SAME code used in the live feed's IntensityStation.Code field, so
@@ -82,6 +81,7 @@ _master_lock = threading.Lock()
 _station_master = {}       # code -> { code, name, name_ja, pref, lat, lon, affi }
 _master_last_fetch_ok = None
 _master_last_error = None
+_current_event_json = None
 
 # A real browser-like User-Agent. JMA's public data endpoints are known to
 # 403 non-browser-looking User-Agents on some hosts (Render's IP ranges
@@ -253,9 +253,12 @@ def fetch_station_master(force=False):
 
 
 def poll_once():
-    """Fetch the latest quake list, pull station readings from the most
-    recent entry that has any, and update _station_state."""
-    global _last_poll_ok, _last_poll_error, _last_poll_attempt
+    global (
+        _last_poll_ok,
+        _last_poll_error,
+        _last_poll_attempt,
+        _current_event_json,
+    )
 
     with _lock:
         _last_poll_attempt = time.time()
@@ -268,80 +271,69 @@ def poll_once():
 
     if not isinstance(quake_list, list):
         with _lock:
-            _last_poll_error = "quake list: response was not a JSON list"
+            _last_poll_error = "quake list was not a JSON list"
         return
+
+    latest = next((q for q in quake_list if q.get("json")), None)
+
+    if latest is None:
+        with _lock:
+            _station_state.clear()
+            _last_poll_error = "no active earthquake"
+        return
+
+    _current_event_json = latest["json"]
+
+    detail, err = fetch_json(
+        DETAIL_BASE + _current_event_json,
+        f"quake detail ({_current_event_json})",
+    )
+
+    if err:
+        with _lock:
+            _last_poll_error = err
+        return
+
+    readings = extract_station_readings(detail)
 
     now = time.time()
 
     with _master_lock:
         master_snapshot = dict(_station_master)
 
-    found_any = False
+    new_state = {}
 
-    for item in quake_list:
-        json_name = item.get("json")
-        if not json_name:
+    for r in readings:
+        code = r.get("code")
+        if not code:
             continue
 
-        detail, err = fetch_json(
-            DETAIL_BASE + json_name,
-            f"quake detail ({json_name})"
-        )
-        if err:
-            continue
+        master = master_snapshot.get(code)
 
-        readings = extract_station_readings(detail)
-        if not readings:
-            continue
-
-        found_any = True
-
-        with _lock:
-            for r in readings:
-                code = r.get("code")
-                if not code:
-                    continue
-
-                existing = _station_state.get(code, {})
-                master = master_snapshot.get(code)
-
-                _station_state[code] = {
-                    "code": code,
-                    "name": r.get("name") or existing.get("name") or code,
-                    "pref": r.get("pref") or existing.get("pref") or (master or {}).get("pref"),
-                    "lat": (master or {}).get("lat", existing.get("lat")),
-                    "lon": (master or {}).get("lon", existing.get("lon")),
-                    "matched": master is not None,
-                    "intensity": r["intensity"],
-                    "eventTime": item.get("at"),
-                    "updatedAt": now,
-                }
+        new_state[code] = {
+            "code": code,
+            "name": r.get("name") or code,
+            "pref": r.get("pref") or (master or {}).get("pref"),
+            "lat": (master or {}).get("lat"),
+            "lon": (master or {}).get("lon"),
+            "matched": master is not None,
+            "intensity": r["intensity"],
+            "eventTime": latest.get("at"),
+            "updatedAt": now,
+        }
 
     with _lock:
+        _station_state.clear()
+        _station_state.update(new_state)
         _last_poll_ok = now
-        _last_poll_error = None if found_any else "no station readings found"
+        _last_poll_error = None
+
+    print(
+        f"[relay] updated {_current_event_json}: {len(new_state)} live stations"
+    )
 
     if not found_any:
         print("[relay] poll_once: no readings this cycle")
-
-
-def decay_loop():
-    while True:
-        time.sleep(10)
-        now = time.time()
-        with _lock:
-            for code, s in list(_station_state.items()):
-                if s["intensity"] <= 0:
-                    continue
-                age = now - s["updatedAt"]
-                if age <= 0:
-                    continue
-                decayed = s["intensity"] * math.pow(0.5, age / DECAY_HALF_LIFE_S)
-                if decayed < 0.05:
-                    s["intensity"] = 0
-                else:
-                    s["intensity"] = decayed
-
 
 def poll_loop():
     global _last_poll_error
@@ -382,7 +374,6 @@ def ensure_poller_started():
             print(f"[relay] initial station master fetch failed: {e}")
             traceback.print_exc()
         threading.Thread(target=poll_loop, daemon=True).start()
-        threading.Thread(target=decay_loop, daemon=True).start()
         print("[relay] background poller started")
 
 
