@@ -438,12 +438,10 @@ def health():
 
 @app.route("/debug-detail")
 def debug_detail():
-    """Fetches the list, takes the first (most recent) event, and tries
-    several plausible detail-URL shapes for JMA's current API (since
-    'json' key based URLs don't exist in the current list.json schema -
-    it uses 'eid' instead). Reports what each attempt returns so we can
-    see the real detail schema and find station-level data if it exists."""
-    import time as _time
+    """Fetches the list, takes the first (most recent) event, and fetches
+    its real detail URL using the 'json' field (DETAIL_BASE + item['json']),
+    exactly like poll_once() does. Reports the raw response plus whether
+    extract_station_readings() finds anything in it."""
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=15)
         quake_list = resp.json()
@@ -454,31 +452,38 @@ def debug_detail():
         return jsonify({"error": "list was empty"})
 
     first = quake_list[0]
-    eid = first.get("eid")
-    ser = first.get("ser", "1")
+    json_field = first.get("json")
+    if not json_field:
+        return jsonify({"error": "first item has no 'json' field", "first_list_item": first})
 
-    candidate_urls = [
-        f"https://www.jma.go.jp/bosai/quake/data/{eid}_{ser}.json",
-        f"https://www.jma.go.jp/bosai/quake/data/{eid}.json",
-        f"https://www.jma.go.jp/bosai/quake/data/list/{eid}.json",
-    ]
+    detail_url = DETAIL_BASE + json_field
+    try:
+        r = requests.get(detail_url, headers=HEADERS, timeout=10)
+    except Exception as e:
+        return jsonify({"error": f"detail fetch failed: {e}", "detail_url": detail_url})
 
-    attempts = []
-    for url in candidate_urls:
+    result = {
+        "detail_url": detail_url,
+        "status": r.status_code,
+    }
+
+    if r.status_code == 200:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=10)
-            attempts.append({
-                "url": url,
-                "status": r.status_code,
-                "body_preview": r.text[:800] if r.status_code == 200 else r.text[:200],
-            })
+            detail_json = r.json()
+            readings = extract_station_readings(detail_json)
+            result["readings_found"] = len(readings)
+            result["sample_readings"] = readings[:5]
+            result["has_Body_key"] = "Body" in detail_json
+            result["top_level_keys"] = list(detail_json.keys())
+            if not readings:
+                result["body_preview"] = r.text[:1500]
         except Exception as e:
-            attempts.append({"url": url, "error": str(e)})
+            result["json_parse_error"] = str(e)
+            result["body_preview"] = r.text[:800]
+    else:
+        result["body_preview"] = r.text[:500]
 
-    return jsonify({
-        "first_list_item": first,
-        "detail_attempts": attempts,
-    })
+    return jsonify(result)
 
 
 @app.route("/debug-fetch")
