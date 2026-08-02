@@ -29,6 +29,7 @@ import time
 import threading
 import traceback
 import functools
+import concurrent.futures
 
 import requests
 from flask import Flask, jsonify
@@ -87,23 +88,39 @@ _session.headers.update(HEADERS)
 
 REQUEST_TIMEOUT = (5, 10)
 
+# Hard wall-clock ceiling for a single fetch_json() call, enforced from
+# OUTSIDE the requests call via a worker thread + .result(timeout=...).
+# REQUEST_TIMEOUT alone is not a reliable ceiling: it only bounds time
+# spent actively connecting/reading on the socket. It does NOT bound
+# things like a stuck DNS resolution, or the requests library blocking
+# while waiting on a shared, pooled Session under some low-level
+# connection states. Symptom seen in production: lastPollAttempt
+# updates, but lastPollOk/lastPollError never do - poll_once() hangs
+# forever inside a fetch_json() call. This wrapper guarantees
+# fetch_json() always returns within FETCH_WATCHDOG_S wall-clock
+# seconds, no matter what requests does internally, so the poll loop
+# can never be stuck for good.
+FETCH_WATCHDOG_S = 20
+_fetch_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="fetch_json"
+)
 
-def fetch_json(url, what):
-    """GET a URL and parse JSON, with real error visibility. Never raises -
-    returns (data, error_string)."""
+
+def _fetch_json_inner(url, what):
     print(f"[relay] fetch_json: starting {what} ({url})")
+    t0 = time.time()
     try:
         resp = _session.get(url, timeout=REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as e:
-        msg = f"{what}: request failed: {e}"
+        msg = f"{what}: request failed after {time.time() - t0:.1f}s: {e}"
         print(f"[relay] {msg}")
         return None, msg
     except Exception as e:
-        msg = f"{what}: unexpected error: {e}"
+        msg = f"{what}: unexpected error after {time.time() - t0:.1f}s: {e}"
         print(f"[relay] {msg}")
         return None, msg
 
-    print(f"[relay] fetch_json: {what} returned HTTP {resp.status_code}")
+    print(f"[relay] fetch_json: {what} returned HTTP {resp.status_code} in {time.time() - t0:.1f}s")
 
     if resp.status_code != 200:
         body_preview = resp.text[:200].replace("\n", " ")
@@ -115,6 +132,22 @@ def fetch_json(url, what):
         return resp.json(), None
     except ValueError as e:
         msg = f"{what}: bad JSON: {e}"
+        print(f"[relay] {msg}")
+        return None, msg
+
+
+def fetch_json(url, what):
+    """GET a URL and parse JSON, with real error visibility. Never raises,
+    and never blocks longer than FETCH_WATCHDOG_S wall-clock seconds -
+    returns (data, error_string) either way. If the underlying call is
+    still stuck when the watchdog fires, the worker thread is abandoned
+    (it will not block process shutdown) and this function returns a
+    timeout error immediately so the poll loop can continue."""
+    future = _fetch_executor.submit(_fetch_json_inner, url, what)
+    try:
+        return future.result(timeout=FETCH_WATCHDOG_S)
+    except concurrent.futures.TimeoutError:
+        msg = f"{what}: watchdog fired - no response within {FETCH_WATCHDOG_S}s (call abandoned, likely stuck below the requests layer)"
         print(f"[relay] {msg}")
         return None, msg
 
@@ -292,6 +325,7 @@ def poll_loop():
     print("[relay] live poll thread started")
 
     while True:
+        cycle_start = time.time()
         try:
             print("[relay] polling JMA...")
 
@@ -307,6 +341,13 @@ def poll_loop():
         except Exception as e:
             print(f"[relay] poll error: {e}")
             traceback.print_exc()
+
+        # Every fetch_json() call is now watchdog-bounded (FETCH_WATCHDOG_S),
+        # so a full cycle should never take dramatically longer than
+        # (events fetched) * FETCH_WATCHDOG_S. Log it so a real hang is
+        # visible in Render's logs rather than silently eating the interval.
+        cycle_elapsed = time.time() - cycle_start
+        print(f"[relay] poll cycle took {cycle_elapsed:.1f}s")
 
         time.sleep(POLL_INTERVAL_S)
 
