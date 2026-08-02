@@ -29,7 +29,6 @@ import time
 import threading
 import math
 import traceback
-import concurrent.futures
 import functools
 
 import requests
@@ -110,35 +109,27 @@ REQUEST_TIMEOUT = (5, 10)  # (connect timeout, read timeout) - explicit tuple so
                            # the read side would otherwise wait the full 10s
 
 
-# Dedicated small pool just for bounding network calls with a REAL wall-clock
-# timeout. requests' own `timeout=` only bounds socket-level connect/read
-# stalls - it does NOT reliably bound every possible hang (e.g. certain DNS
-# resolution paths, some TLS handshake edge cases, or contention under
-# gunicorn's gthread worker). Running the call in a worker thread and
-# calling .result(timeout=...) on it gives a hard ceiling no matter what
-# the underlying cause of a hang turns out to be.
-_fetch_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="fetch")
-HARD_WALLCLOCK_TIMEOUT = 20  # seconds - absolute ceiling per fetch_json() call
-
-
-def _do_get(url):
-    return _session.get(url, timeout=REQUEST_TIMEOUT)
+# NOTE: an earlier version of this file routed fetch_json() through a
+# ThreadPoolExecutor with a hard .result(timeout=...) ceiling, intended to
+# guarantee no request could hang the poll loop indefinitely. In practice,
+# that indirection was the actual bug: calls submitted from inside the
+# background poll thread never completed, while the identical request made
+# directly (e.g. from a Flask request handler in /debug-detail) worked
+# fine every time. Removed in favor of calling requests.get() directly,
+# which is proven working. REQUEST_TIMEOUT below still bounds each call at
+# the socket level.
 
 
 def fetch_json(url, what):
-    """GET a URL and parse JSON, with real error visibility and a hard
-    wall-clock ceiling. Never raises - returns (data, error_string). Every
-    entry/exit and failure path prints to stdout (captured in Render's log
-    stream) so failures - or hangs - are never silent."""
+    """GET a URL and parse JSON, with real error visibility. Never raises -
+    returns (data, error_string). Calls requests.get() directly (no thread
+    pool indirection) - this matches /debug-detail exactly, which is
+    confirmed working against live JMA data, whereas the previous
+    ThreadPoolExecutor-based version never completed a single successful
+    call from inside the background poll thread."""
     print(f"[relay] fetch_json: starting {what} ({url})")
-    future = _fetch_pool.submit(_do_get, url)
     try:
-        resp = future.result(timeout=HARD_WALLCLOCK_TIMEOUT)
-    except concurrent.futures.TimeoutError:
-        msg = f"{what}: hard timeout after {HARD_WALLCLOCK_TIMEOUT}s (request never returned)"
-        print(f"[relay] {msg}")
-        future.cancel()
-        return None, msg
+        resp = _session.get(url, timeout=REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as e:
         msg = f"{what}: request failed: {e}"
         print(f"[relay] {msg}")
@@ -151,7 +142,6 @@ def fetch_json(url, what):
     print(f"[relay] fetch_json: {what} returned HTTP {resp.status_code}")
 
     if resp.status_code != 200:
-        # Truncate body so a big HTML error page doesn't spam logs.
         body_preview = resp.text[:200].replace("\n", " ")
         msg = f"{what}: HTTP {resp.status_code} - {body_preview}"
         print(f"[relay] {msg}")
