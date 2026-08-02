@@ -491,13 +491,30 @@ def ensure_poller_started():
 
 @app.route("/stations")
 def stations():
-    with _lock:
+    with _lock, _master_lock:
+        stations = []
+
+        for code, master in _station_master.items():
+            live = _station_state.get(code)
+
+            stations.append({
+                "code": code,
+                "name": master.get("name_ja") or code,
+                "pref": master.get("pref"),
+                "lat": master.get("lat"),
+                "lon": master.get("lon"),
+                "matched": True,
+                "intensity": live["intensity"] if live else 0,
+                "eventTime": live.get("eventTime") if live else None,
+                "updatedAt": live.get("updatedAt") if live else None,
+            })
+
         return jsonify({
             "pid": os.getpid(),
-            "stationCount": len(_station_state),
+            "stationCount": len(stations),
             "updatedAt": _last_poll_ok,
             "error": _last_poll_error,
-            "stations": list(_station_state.values()),
+            "stations": stations,
         })
 
 
