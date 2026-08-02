@@ -44,6 +44,42 @@ MAX_EVENTS_PER_POLL of them, until it finds intensity data or runs out
 of budget/window. In the common case (newest event has data) this costs
 exactly the same single fetch as before.
 --------------------------------------------------------------------
+
+--------------------------------------------------------------------
+FIX 2 (see fetch_json / _fetch_executor): the original watchdog used a
+single shared ThreadPoolExecutor(max_workers=4) for every fetch_json()
+call in the whole process. future.result(timeout=...) only bounds the
+time spent WAITING for a future - it does not, and cannot, kill the
+underlying thread if the call is stuck below the requests layer (e.g.
+hung DNS, hung socket read that ignores our REQUEST_TIMEOUT for some
+reason, etc). When that happens the worker thread is never returned to
+the pool - it's just gone, permanently, since Python threads can't be
+force-killed. With only 4 workers, four unlucky stuck calls (spread out
+over time, e.g. one per poll cycle) are enough to exhaust the pool
+completely. After that, every future fetch_json() call submits a task
+that sits queued behind the (permanently stuck) running ones and never
+even starts - so future.result(timeout=20) has nothing running to time
+out on for that submitted future, and the call to .result() itself does
+still raise after 20s (good), but it does NOT free up a worker, so the
+pool stays dead forever and every subsequent poll cycle's very first
+fetch_json() call - which is at the top of poll_once(), before
+_last_poll_ok/_last_poll_error ever get touched - just queues forever.
+That's the exact "lastPollAttempt updates, lastPollOk/lastPollError
+never do, health stuck forever" symptom this file already had one fix
+for.
+
+Fix: stop sharing one small fixed-size pool across the whole app for a
+resource that can silently and permanently leak workers. Each
+fetch_json() call now gets its own single-worker, throwaway executor,
+created fresh per call and discarded afterward. If a call hangs below
+the requests layer, only that one dedicated thread leaks - it doesn't
+consume a shared slot that starves every other fetch in the app, and
+future.result(timeout=...) can reliably bound wall-clock time for that
+call from the caller's perspective every single time, forever, no
+matter how many previous calls got stuck. This costs a small amount of
+thread-creation overhead per fetch, which is a non-issue for a service
+polling every 20s.
+--------------------------------------------------------------------
 """
 
 import os
@@ -119,21 +155,26 @@ _session.headers.update(HEADERS)
 REQUEST_TIMEOUT = (5, 10)
 
 # Hard wall-clock ceiling for a single fetch_json() call, enforced from
-# OUTSIDE the requests call via a worker thread + .result(timeout=...).
-# REQUEST_TIMEOUT alone is not a reliable ceiling: it only bounds time
-# spent actively connecting/reading on the socket. It does NOT bound
-# things like a stuck DNS resolution, or the requests library blocking
-# while waiting on a shared, pooled Session under some low-level
-# connection states. Symptom seen in production: lastPollAttempt
-# updates, but lastPollOk/lastPollError never do - poll_once() hangs
-# forever inside a fetch_json() call. This wrapper guarantees
-# fetch_json() always returns within FETCH_WATCHDOG_S wall-clock
-# seconds, no matter what requests does internally, so the poll loop
-# can never be stuck for good.
+# OUTSIDE the requests call via a dedicated single-use worker thread +
+# .result(timeout=...). REQUEST_TIMEOUT alone is not a reliable ceiling:
+# it only bounds time spent actively connecting/reading on the socket.
+# It does NOT bound things like a stuck DNS resolution, or the requests
+# library blocking while waiting on a shared, pooled Session under some
+# low-level connection states.
+#
+# NOTE: this used to be backed by one shared, fixed-size
+# ThreadPoolExecutor(max_workers=4) for the whole process. That let a
+# handful of stuck calls (over time) permanently exhaust all 4 workers,
+# since a stuck thread is never returned to the pool - and once the pool
+# was exhausted, every future fetch_json() call queued forever with no
+# way to time out, because there was nothing running yet to time out on
+# from that future's perspective. See the FIX 2 note in the module
+# docstring above for the full story. Each fetch_json() call now spins
+# up its own one-off single-worker executor and discards it afterward,
+# so a stuck call can only ever leak the one thread dedicated to it -
+# it can never starve unrelated calls, and this function's timeout
+# behavior is now reliable no matter how many previous calls got stuck.
 FETCH_WATCHDOG_S = 20
-_fetch_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="fetch_json"
-)
 
 
 def _fetch_json_inner(url, what):
@@ -170,16 +211,35 @@ def fetch_json(url, what):
     """GET a URL and parse JSON, with real error visibility. Never raises,
     and never blocks longer than FETCH_WATCHDOG_S wall-clock seconds -
     returns (data, error_string) either way. If the underlying call is
-    still stuck when the watchdog fires, the worker thread is abandoned
-    (it will not block process shutdown) and this function returns a
-    timeout error immediately so the poll loop can continue."""
-    future = _fetch_executor.submit(_fetch_json_inner, url, what)
+    still stuck when the watchdog fires, the dedicated worker thread for
+    this call is abandoned (it will not block process shutdown, and it
+    cannot starve any other fetch_json() call since it isn't shared) and
+    this function returns a timeout error immediately so the poll loop
+    can continue.
+
+    Each call gets its own single-worker executor rather than sharing a
+    process-wide pool - see the FIX 2 note in the module docstring for
+    why the old shared-pool design could permanently wedge the poller.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="fetch_json"
+    )
     try:
-        return future.result(timeout=FETCH_WATCHDOG_S)
-    except concurrent.futures.TimeoutError:
-        msg = f"{what}: watchdog fired - no response within {FETCH_WATCHDOG_S}s (call abandoned, likely stuck below the requests layer)"
-        print(f"[relay] {msg}")
-        return None, msg
+        future = executor.submit(_fetch_json_inner, url, what)
+        try:
+            return future.result(timeout=FETCH_WATCHDOG_S)
+        except concurrent.futures.TimeoutError:
+            msg = f"{what}: watchdog fired - no response within {FETCH_WATCHDOG_S}s (call abandoned, likely stuck below the requests layer)"
+            print(f"[relay] {msg}")
+            return None, msg
+    finally:
+        # shutdown(wait=False) never blocks: if _fetch_json_inner is
+        # still stuck, this just detaches from that one thread instead
+        # of waiting on it (which would defeat the whole point of the
+        # watchdog). The thread leaks in that case, but it's a single
+        # dedicated thread rather than a shared pool slot, so it can't
+        # starve anything else.
+        executor.shutdown(wait=False)
 
 
 def normalize_intensity(raw):
@@ -473,10 +533,14 @@ def poll_loop():
             with _lock:
                 _last_poll_error = msg
 
-        # Every fetch_json() call is now watchdog-bounded (FETCH_WATCHDOG_S),
-        # so a full cycle should never take dramatically longer than
-        # (events fetched) * FETCH_WATCHDOG_S. Log it so a real hang is
-        # visible in Render's logs rather than silently eating the interval.
+        # Every fetch_json() call is now watchdog-bounded (FETCH_WATCHDOG_S)
+        # via its own dedicated single-use executor, so a full cycle
+        # should never take dramatically longer than
+        # (events fetched) * FETCH_WATCHDOG_S, and - critically - a
+        # previous cycle's stuck call can no longer eat into this
+        # guarantee for later cycles the way a shared pool could. Log it
+        # so a real hang is visible in Render's logs rather than
+        # silently eating the interval.
         cycle_elapsed = time.time() - cycle_start
         print(f"[relay] poll cycle took {cycle_elapsed:.1f}s")
 
