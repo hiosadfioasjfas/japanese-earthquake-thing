@@ -254,83 +254,78 @@ def fetch_station_master(force=False):
 
 def poll_once():
     """Fetch the latest quake list, pull station readings from the most
-    recent entry that has any, and update _station_state. Guarantees
-    _last_poll_ok/_last_poll_error are updated on EVERY exit path -
-    including early-return failures - so /health always reflects the
-    real current state instead of stale nulls."""
+    recent entry that has any, and update _station_state."""
     global _last_poll_ok, _last_poll_error, _last_poll_attempt
 
     with _lock:
         _last_poll_attempt = time.time()
 
-quake_list, err = fetch_json(LIST_URL, "quake list")
-if err:
-    with _lock:
-        _last_poll_error = err
-    return
-
-if not isinstance(quake_list, list):
-    with _lock:
-        _last_poll_error = "quake list: response was not a JSON list"
-    return
-
-now = time.time()
-
-with _master_lock:
-    master_snapshot = dict(_station_master)
-
-found_any = False
-
-for item in quake_list:
-    json_name = item.get("json")
-    if not json_name:
-        continue
-
-    detail, err = fetch_json(
-        DETAIL_BASE + json_name,
-        f"quake detail ({json_name})"
-    )
+    quake_list, err = fetch_json(LIST_URL, "quake list")
     if err:
-        continue
+        with _lock:
+            _last_poll_error = err
+        return
 
-    readings = extract_station_readings(detail)
-    if not readings:
-        continue
+    if not isinstance(quake_list, list):
+        with _lock:
+            _last_poll_error = "quake list: response was not a JSON list"
+        return
 
-    found_any = True
+    now = time.time()
+
+    with _master_lock:
+        master_snapshot = dict(_station_master)
+
+    found_any = False
+
+    for item in quake_list:
+        json_name = item.get("json")
+        if not json_name:
+            continue
+
+        detail, err = fetch_json(
+            DETAIL_BASE + json_name,
+            f"quake detail ({json_name})"
+        )
+        if err:
+            continue
+
+        readings = extract_station_readings(detail)
+        if not readings:
+            continue
+
+        found_any = True
+
+        with _lock:
+            for r in readings:
+                code = r.get("code")
+                if not code:
+                    continue
+
+                existing = _station_state.get(code, {})
+                master = master_snapshot.get(code)
+
+                if r["intensity"] <= existing.get("intensity", 0):
+                    continue
+
+                _station_state[code] = {
+                    "code": code,
+                    "name": r.get("name") or existing.get("name") or code,
+                    "pref": r.get("pref") or existing.get("pref") or (master or {}).get("pref"),
+                    "lat": (master or {}).get("lat", existing.get("lat")),
+                    "lon": (master or {}).get("lon", existing.get("lon")),
+                    "matched": master is not None,
+                    "intensity": r["intensity"],
+                    "eventTime": item.get("at"),
+                    "updatedAt": now,
+                }
 
     with _lock:
-        for r in readings:
-            code = r.get("code")
-            if not code:
-                continue
+        _last_poll_ok = now
+        _last_poll_error = None if found_any else "no station readings found"
 
-            existing = _station_state.get(code, {})
-            master = master_snapshot.get(code)
-
-            # Keep the strongest reading if this station appears
-            # in multiple earthquakes.
-            if r["intensity"] <= existing.get("intensity", 0):
-                continue
-
-            _station_state[code] = {
-                "code": code,
-                "name": r.get("name") or existing.get("name") or code,
-                "pref": r.get("pref") or existing.get("pref") or (master or {}).get("pref"),
-                "lat": (master or {}).get("lat", existing.get("lat")),
-                "lon": (master or {}).get("lon", existing.get("lon")),
-                "matched": master is not None,
-                "intensity": r["intensity"],
-                "eventTime": item.get("at"),
-                "updatedAt": now,
-            }
-
-with _lock:
-    _last_poll_ok = now
-    _last_poll_error = None if found_any else "no station readings found"
-
-    if not found_readings:
-        print(f"[relay] poll_once: no readings this cycle ({len(recent)} candidates checked)")
+    if not found_any:
+        print("[relay] poll_once: no readings this cycle")
 
 
 def decay_loop():
