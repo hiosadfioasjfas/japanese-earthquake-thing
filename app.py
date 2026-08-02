@@ -328,6 +328,10 @@ def poll_once():
     if not merged:
         print("[relay] poll_once: no readings this cycle")
 
+print(
+    f"[relay] pid={os.getpid()} updated: {len(_station_state)} stations"
+)
+
 def poll_loop():
     print("[relay] live poll thread started")
 
@@ -375,12 +379,13 @@ def ensure_poller_started():
 
 @app.route("/stations")
 def stations():
-    with _lock:
-        return jsonify({
-            "updatedAt": _last_poll_ok,
-            "error": _last_poll_error,
-            "stations": list(_station_state.values()),
-        })
+    return jsonify({
+        "pid": os.getpid(),
+        "stationCount": len(_station_state),
+        "updatedAt": _last_poll_ok,
+        "error": _last_poll_error,
+        "stations": list(_station_state.values()),
+    })
 
 
 @app.route("/all-stations")
