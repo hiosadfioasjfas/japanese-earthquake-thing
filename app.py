@@ -270,43 +270,22 @@ def poll_once():
             _last_poll_error = "quake list was not a JSON list"
         return
 
-    latest = None
+    recent = [q for q in quake_list if q.get("json")][:20]
 
-    for q in quake_list:
-        if q.get("json") and q.get("status") != "cancel":
-            latest = q
-            break
+merged = {}
 
-    if latest is None:
-        with _lock:
-            _station_state.clear()
-            _last_poll_error = "no active earthquake"
-        return
-
-    _current_event_json = latest["json"]
-
+for item in recent:
     detail, err = fetch_json(
-        DETAIL_BASE + _current_event_json,
-        f"quake detail ({_current_event_json})",
+        DETAIL_BASE + item["json"],
+        f"quake detail ({item['json']})",
     )
 
-    if err:
-        with _lock:
-            _last_poll_error = err
-        return
+    if err or not detail:
+        continue
 
     readings = extract_station_readings(detail)
 
-    print(
-        f"[relay] event { _current_event_json } "
-        f"produced {len(readings)} station readings"
-    )
     now = time.time()
-
-    with _master_lock:
-        master_snapshot = dict(_station_master)
-
-    new_state = {}
 
     for r in readings:
         code = r.get("code")
@@ -315,24 +294,28 @@ def poll_once():
 
         master = master_snapshot.get(code)
 
-        new_state[code] = {
-            "code": code,
-            "name": r.get("name") or code,
-            "pref": r.get("pref") or (master or {}).get("pref"),
-            "lat": (master or {}).get("lat"),
-            "lon": (master or {}).get("lon"),
-            "matched": master is not None,
-            "intensity": r["intensity"],
-            "eventTime": latest.get("at"),
-            "updatedAt": now,
-        }
+        if (
+            code not in merged or
+            r["intensity"] > merged[code]["intensity"]
+        ):
+            merged[code] = {
+                "code": code,
+                "name": r.get("name") or code,
+                "pref": r.get("pref") or (master or {}).get("pref"),
+                "lat": (master or {}).get("lat"),
+                "lon": (master or {}).get("lon"),
+                "matched": master is not None,
+                "intensity": r["intensity"],
+                "eventTime": item.get("at"),
+                "updatedAt": now,
+            }
 
-    with _lock:
-        _station_state.clear()
-        _station_state.update(new_state)
-        _last_poll_ok = now
-        _last_poll_error = None
-
+with _lock:
+    _station_state.clear()
+    _station_state.update(merged)
+    _last_poll_ok = now
+    _last_poll_error = None
+  
     print(
         f"[relay] updated {_current_event_json}: {len(new_state)} live stations"
     )
